@@ -88,8 +88,8 @@ push_config = {
 
     'QYWX_KEY': '',                     # 企业微信机器人
 
-    'TG_BOT_TOKEN': '',                 # tg 机器人的 TG_BOT_TOKEN
-    'TG_USER_ID': '',                   # tg 机器人的 TG_USER_ID
+    'TG_BOT_TOKEN': '8374016552:AAGzLSvdSUndaiJ61ZIkvk5p50CHvh6IBI4',                 # tg 机器人的 TG_BOT_TOKEN
+    'TG_USER_ID': '1946323158',                   # tg 机器人的 TG_USER_ID
     'TG_API_HOST': '',                  # tg 代理 api
     'TG_PROXY_AUTH': '',                # tg 代理认证参数
     'TG_PROXY_HOST': '',                # tg 机器人的 TG_PROXY_HOST
