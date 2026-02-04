@@ -51,7 +51,7 @@ except ImportError:
 
 def init_selenium(debug=False, headless=False):
     ops = webdriver.ChromeOptions()
-    if headless or os.environ.get("GITHUB_ACTIONS", "false") == "true":
+    if headless or os.environ.get("GIT_ACTIONS", "false") == "true":
         for option in ['--headless', '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']:
             ops.add_argument(option)
     ops.add_argument('--window-size=1920,1080')
@@ -59,8 +59,8 @@ def init_selenium(debug=False, headless=False):
     ops.add_argument('--no-proxy-server')
     ops.add_argument('--lang=zh-CN')
     
-    is_github_actions = os.environ.get("GITHUB_ACTIONS", "false") == "true"
-    if debug and not is_github_actions:
+    is_GIT_ACTIONS = os.environ.get("GIT_ACTIONS", "false") == "true"
+    if debug and not is_GIT_ACTIONS:
         ops.add_experimental_option("detach", True)
     
     try:
@@ -443,10 +443,10 @@ def sign_in_account(user, pwd, debug=False, headless=False):
             except: pass
 
 if __name__ == "__main__":
-    is_github_actions = os.environ.get("GITHUB_ACTIONS", "false") == "true"
+    is_GIT_ACTIONS = os.environ.get("GIT_ACTIONS", "false") == "true"
     debug = os.environ.get('DEBUG', 'false').lower() == 'true'
     headless = os.environ.get('HEADLESS', 'false').lower() == 'true'
-    if is_github_actions: headless = True
+    if is_GIT_ACTIONS: headless = True
     
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     logger = logging.getLogger(__name__)
