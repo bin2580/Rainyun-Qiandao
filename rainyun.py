@@ -3,11 +3,9 @@ import os
 import random
 import re
 import time
-import subprocess
-import sys
+import platform  # 新增：自动识别系统
 
 import cv2
-import ddddocr
 import requests
 from selenium import webdriver
 from selenium.common import TimeoutException
@@ -19,489 +17,319 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.wait import WebDriverWait
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
-# --- 修复1：正确的 webdriver_manager 导入 ---
-try:
-    from webdriver_manager.chrome import ChromeDriverManager
-    try:
-        from webdriver_manager.core.utils import ChromeType
-    except ImportError:
-        try:
-            from webdriver_manager.chrome import ChromeType
-        except ImportError:
-            ChromeType = None
-except ImportError:
-    print("webdriver_manager未安装，将使用备用方式")
-    ChromeDriverManager = None
-    ChromeType = None
-
-# --- 修复2：确保 notify 正常导入 ---
-try:
-    from notify import send
-    print("已加载通知模块 (notify.py)")
-except ImportError:
-    print("警告: 未找到 notify.py，将无法发送通知。")
-    def send(*args, **kwargs):
-        pass
+# 注意：ICR 库需要确保已安装，若未安装请执行：pip install ICR
+import ICR
 
 
-def init_selenium(debug=False, headless=False):
-    ops = webdriver.ChromeOptions()
-    if headless or os.environ.get("GITHUB_ACTIONS", "false") == "true":
-        for option in ['--headless', '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']:
-            ops.add_argument(option)
-    ops.add_argument('--window-size=1920,1080')
-    ops.add_argument('--disable-blink-features=AutomationControlled')
-    ops.add_argument('--no-proxy-server')
-    ops.add_argument('--lang=zh-CN')
+def init_selenium() -> WebDriver:
+    ops = Options()
+    # 通用配置
+    ops.add_argument("--no-sandbox")  # 解决Linux沙箱问题
+    ops.add_argument("--disable-dev-shm-usage")  # 解决内存不足问题
+    ops.add_argument("--disable-blink-features=AutomationControlled")  # 绕过检测
+    ops.add_experimental_option("excludeSwitches", ["enable-automation"])
+    ops.add_experimental_option('useAutomationExtension', False)
     
-    is_github_actions = os.environ.get("GITHUB_ACTIONS", "false") == "true"
-    if debug and not is_github_actions:
+    # 自动识别系统（替代手动设置linux变量）
+    system = platform.system().lower()
+    if debug:
         ops.add_experimental_option("detach", True)
+    if system == "linux":
+        # Linux/青龙面板专属配置
+        ops.add_argument("--headless=new")  # 新版无头模式（比旧版--headless更稳定）
+        ops.add_argument("--disable-gpu")
+        # 使用系统自带的chromedriver（无需手动放置文件）
+        try:
+            # 优先使用系统路径的chromedriver
+            driver = webdriver.Chrome(service=Service("/usr/bin/chromedriver"), options=ops)
+        except:
+            # 备用：自动查找chromedriver
+            driver = webdriver.Chrome(options=ops)
+    else:
+        # Windows系统配置
+        driver = webdriver.Chrome(service=Service("chromedriver.exe"), options=ops)
     
-    try:
-        if ChromeDriverManager:
-            if ChromeType and hasattr(ChromeType, 'GOOGLE'):
-                manager = ChromeDriverManager(chrome_type=ChromeType.GOOGLE)
-            else:
-                manager = ChromeDriverManager()
-            driver_path = manager.install()
-            service = Service(driver_path)
-            driver = webdriver.Chrome(service=service, options=ops)
-            return driver
-    except Exception as e:
-        print(f"webdriver-manager失败: {e}")
+    return driver
 
-    # 备用方案
-    try:
-        driver = webdriver.Chrome(options=ops)
-        return driver
-    except Exception:
-        pass
-        
-    raise Exception("无法初始化Selenium WebDriver")
 
 def download_image(url, filename):
     os.makedirs("temp", exist_ok=True)
+    # 增加请求头，避免被反爬
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
     try:
-        response = requests.get(url, timeout=10, proxies={"http": None, "https": None}, verify=False)
-        if response.status_code == 200:
-            with open(os.path.join("temp", filename), "wb") as f:
-                f.write(response.content)
-            return True
-        return False
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()  # 抛出HTTP错误
+        path = os.path.join("temp", filename)
+        with open(path, "wb") as f:
+            f.write(response.content)
+        return True
     except Exception as e:
-        logger.error(f"下载图片异常: {str(e)}")
+        logger.error(f"下载图片失败：{e}")
         return False
 
 
 def get_url_from_style(style):
-    return re.search(r'url\(["\']?(.*?)["\']?\)', style).group(1)
+    """从style属性中提取图片URL"""
+    match = re.search(r'url\(["\']?(.*?)["\']?\)', style)
+    if match:
+        return match.group(1)
+    logger.error("未从style中提取到URL")
+    return ""
 
 
 def get_width_from_style(style):
-    return re.search(r'width:\s*([\d.]+)px', style).group(1)
+    """从style属性中提取宽度"""
+    match = re.search(r'width:\s*([\d.]+)px', style)
+    if match:
+        return match.group(1)
+    logger.error("未从style中提取到宽度")
+    return "0"
 
 
 def get_height_from_style(style):
-    return re.search(r'height:\s*([\d.]+)px', style).group(1)
+    """从style属性中提取高度"""
+    match = re.search(r'height:\s*([\d.]+)px', style)
+    if match:
+        return match.group(1)
+    logger.error("未从style中提取到高度")
+    return "0"
 
-# --- 修复3：process_captcha 需要使用全局变量 ---
+
 def process_captcha():
-    # 声明使用全局变量，防止报错
-    global ocr, det, wait, driver
-    
+    """处理验证码识别与点击"""
     try:
         download_captcha_img()
-        if check_captcha():
-            logger.info("开始识别验证码")
-            captcha = cv2.imread("temp/captcha.jpg")
-            with open("temp/captcha.jpg", 'rb') as f:
-                captcha_b = f.read()
-            bboxes = det.detection(captcha_b)
-            result = dict()
-            for i in range(len(bboxes)):
-                x1, y1, x2, y2 = bboxes[i]
-                spec = captcha[y1:y2, x1:x2]
-                cv2.imwrite(f"temp/spec_{i + 1}.jpg", spec)
-                for j in range(3):
-                    similarity, matched = compute_similarity(f"temp/sprite_{j + 1}.jpg", f"temp/spec_{i + 1}.jpg")
-                    similarity_key = f"sprite_{j + 1}.similarity"
-                    position_key = f"sprite_{j + 1}.position"
-                    if similarity_key in result.keys():
-                        if float(result[similarity_key]) < similarity:
-                            result[similarity_key] = similarity
-                            result[position_key] = f"{int((x1 + x2) / 2)},{int((y1 + y2) / 2)}"
-                    else:
-                        result[similarity_key] = similarity
-                        result[position_key] = f"{int((x1 + x2) / 2)},{int((y1 + y2) / 2)}"
-            if check_answer(result):
-                for i in range(3):
-                    similarity_key = f"sprite_{i + 1}.similarity"
-                    position_key = f"sprite_{i + 1}.position"
-                    positon = result[position_key]
-                    logger.info(f"图案 {i + 1} 位于 ({positon})，匹配率：{result[similarity_key]}")
-                    slideBg = wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="slideBg"]')))
-                    style = slideBg.get_attribute("style")
-                    x, y = int(positon.split(",")[0]), int(positon.split(",")[1])
-                    width_raw, height_raw = captcha.shape[1], captcha.shape[0]
-                    width, height = float(get_width_from_style(style)), float(get_height_from_style(style))
-                    x_offset, y_offset = float(-width / 2), float(-height / 2)
-                    final_x, final_y = int(x_offset + x / width_raw * width), int(y_offset + y / height_raw * height)
-                    ActionChains(driver).move_to_element_with_offset(slideBg, final_x, final_y).click().perform()
-                confirm = wait.until(
-                    EC.element_to_be_clickable((By.XPATH, '//*[@id="tcStatus"]/div[2]/div[2]/div/div')))
-                logger.info("提交验证码")
-                confirm.click()
-                time.sleep(5)
-                result = wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="tcOperation"]')))
-                if result.get_attribute("class") == 'tc-opera pointer show-success':
-                    logger.info("验证码通过")
-                    return
-                else:
-                    logger.error("验证码未通过，正在重试")
-            else:
-                logger.error("验证码识别失败，正在重试")
+        logger.info("开始识别验证码")
+        captcha_path = "temp/captcha.jpg"
+        sprite_path = "temp/sprite.jpg"
+        # 检查图片是否存在
+        if not os.path.exists(captcha_path) or not os.path.exists(sprite_path):
+            logger.error("验证码图片缺失，无法识别")
+            raise Exception("验证码图片缺失")
+        
+        captcha = cv2.imread(captcha_path)
+        if captcha is None:
+            logger.error("验证码图片读取失败")
+            raise Exception("验证码图片读取失败")
+        
+        result = ICR.main(captcha_path, sprite_path)
+        if not result:
+            logger.error("ICR识别验证码返回空结果")
+            raise Exception("验证码识别失败")
+        
+        for info in result:
+            rect = info['bg_rect']
+            x, y = int(rect[0] + (rect[2] / 2)), int(rect[1] + (rect[3] / 2))
+            logger.info(f"图案 {info['sprite_idx'] + 1} 位于 ({x}, {y})")
+            slideBg = wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="slideBg"]')))
+            style = slideBg.get_attribute("style")
+            width_raw, height_raw = captcha.shape[1], captcha.shape[0]
+            width, height = float(get_width_from_style(style)), float(get_height_from_style(style))
+            x_offset, y_offset = float(-width / 2), float(-height / 2)
+            final_x, final_y = int(x_offset + x / width_raw * width), int(y_offset + y / height_raw * height)
+            # 模拟人类点击（增加小随机偏移）
+            final_x += random.randint(-2, 2)
+            final_y += random.randint(-2, 2)
+            ActionChains(driver).move_to_element_with_offset(slideBg, final_x, final_y).click().perform()
+            time.sleep(random.uniform(0.5, 1.5))  # 随机延时，模拟人类操作
+        
+        # 点击确认按钮
+        confirm = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="tcStatus"]/div[2]/div[2]/div/div')))
+        logger.info("提交验证码")
+        confirm.click()
+        time.sleep(5)
+        
+        # 验证验证码是否通过
+        result = wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="tcOperation"]')))
+        if result.get_attribute("class") == 'tc-opera pointer show-success':
+            logger.info("验证码通过")
+            return
         else:
-            logger.error("当前验证码识别率低，尝试刷新")
-            
-        # 确保在 iframe 内能找到 reload 元素，或者逻辑要切出去
-        # 原逻辑未切换 frame，直接找 reload，这可能导致找不到元素报错
-        # 简单修复：包裹在 try-except 中
-        try:
-             reload = driver.find_element(By.XPATH, '//*[@id="reload"]')
-             time.sleep(2)
-             reload.click()
-             time.sleep(5)
-             process_captcha()
-        except:
-             pass
-
+            logger.error("验证码未通过，正在重试")
+            reload = driver.find_element(By.XPATH, '//*[@id="reload"]')
+            time.sleep(5)
+            reload.click()
+            time.sleep(5)
+            process_captcha()  # 递归重试
     except TimeoutException:
-        logger.error("获取验证码图片失败")
+        logger.error("获取验证码元素超时")
     except Exception as e:
-        logger.error(f"处理验证码时发生错误: {e}") # 打印具体错误，方便调试
+        logger.error(f"处理验证码异常：{e}")
+        # 重试逻辑
+        try:
+            reload = driver.find_element(By.XPATH, '//*[@id="reload"]')
+            reload.click()
+            time.sleep(5)
+            process_captcha()
+        except:
+            logger.error("验证码重试失败")
 
 
 def download_captcha_img():
-    # 声明使用全局 wait
-    global wait
-    
+    """下载验证码背景图和滑块图"""
+    # 清空temp目录
     if os.path.exists("temp"):
         for filename in os.listdir("temp"):
             file_path = os.path.join("temp", filename)
-            if os.path.isfile(file_path) or os.path.islink(file_path):
-                os.remove(file_path)
-    slideBg = wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="slideBg"]')))
-    img1_style = slideBg.get_attribute("style")
-    img1_url = get_url_from_style(img1_style)
-    logger.info("开始下载验证码图片(1): " + img1_url)
-    download_image(img1_url, "captcha.jpg")
-    sprite = wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="instruction"]/div/img')))
-    img2_url = sprite.get_attribute("src")
-    logger.info("开始下载验证码图片(2): " + img2_url)
-    download_image(img2_url, "sprite.jpg")
-
-
-def check_captcha() -> bool:
-    # 声明使用全局 ocr
-    global ocr
-    
-    try:
-        raw = cv2.imread("temp/sprite.jpg")
-        if raw is None: return False
-        
-        gray = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY)
-        laplacian = cv2.Laplacian(gray, cv2.CV_64F).var()
-        if laplacian < 50: return False
-            
-        h, w = raw.shape[:2]
-        for i in range(3):
-            w_segment = w // 3
-            start_x = max(0, w_segment * i + 2)
-            end_x = min(w, w_segment * (i + 1) - 2)
-            temp = raw[:, start_x:end_x]
-            cv2.imwrite(f"temp/sprite_{i + 1}.jpg", temp)
-            
-            with open(f"temp/sprite_{i + 1}.jpg", mode="rb") as f:
-                temp_rb = f.read()
             try:
-                result = ocr.classification(temp_rb)
-                if result in ["0", "1"]: return False
-            except Exception:
-                return False
-        return True
-    except Exception:
-        return False
-
-
-def check_answer(d: dict) -> bool:
-    flipped = dict()
-    for key in d.keys():
-        flipped[d[key]] = key
-    if len(d.values()) != len(flipped.keys()):
-        return False
-    return True
-
-
-def preprocess_image(image):
-    blurred = cv2.GaussianBlur(image, (5, 5), 0)
-    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-    return morph
-
-def compute_similarity(img1_path, img2_path):
-    img1 = cv2.imread(img1_path, cv2.IMREAD_GRAYSCALE)
-    img2 = cv2.imread(img2_path, cv2.IMREAD_GRAYSCALE)
-    if img1 is None or img2 is None: return 0.0, 0
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    os.remove(file_path)
+            except Exception as e:
+                logger.warning(f"删除临时文件失败：{e}")
     
-    scale = 100.0 / max(img1.shape) if max(img1.shape) > 100 else 1.0
-    img1 = cv2.resize(img1, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    scale = 100.0 / max(img2.shape) if max(img2.shape) > 100 else 1.0
-    img2 = cv2.resize(img2, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    
-    img1 = preprocess_image(img1)
-    img2 = preprocess_image(img2)
-
+    # 下载背景图
     try:
-        sift = cv2.SIFT_create()
-        kp1, des1 = sift.detectAndCompute(img1, None)
-        kp2, des2 = sift.detectAndCompute(img2, None)
-        if des1 is None or des2 is None: return 0.0, 0
-
-        flann = cv2.FlannBasedMatcher(dict(algorithm=1, trees=5), dict(checks=50))
-        matches = flann.knnMatch(des1, des2, k=2)
-        good = [m for m, n in matches if m.distance < 0.7 * n.distance]
-        
-        if len(good) == 0: return 0.0, 0
-        feature_factor = min(1.0, len(kp1) / 100.0, len(kp2) / 100.0)
-        match_ratio = len(good) / min(len(des1), len(des2))
-        return match_ratio * 0.7 + feature_factor * 0.3, len(good)
-    except Exception:
-        return 0.0, 0
-
-
-def sign_in_account(user, pwd, debug=False, headless=False):
-    timeout = 15
-    driver = None
-    
-    # --- 修复4：声明全局变量，以便 process_captcha 调用 ---
-    global ocr, det, wait 
-    
-    try:
-        logger.info(f"开始处理账户: {user}")
-        if not debug:
-            time.sleep(random.randint(5, 10))
-        
-        logger.info("初始化 ddddocr")
-        ocr = ddddocr.DdddOcr(ocr=True, show_ad=False)
-        det = ddddocr.DdddOcr(det=True, show_ad=False)
-        
-        logger.info("初始化 Selenium")
-        driver = init_selenium(debug=debug, headless=headless)
-        
-        # 临时将 driver 设为全局，供 process_captcha 使用
-        globals()['driver'] = driver 
-        
-        try:
-            with open("stealth.min.js", mode="r") as f: js = f.read()
-            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": js})
-        except: pass
-        
-        logger.info("发起登录请求")
-        driver.get("https://app.rainyun.com/auth/login")
-        wait = WebDriverWait(driver, timeout)
-        
-        # 登录流程
-        username = wait.until(EC.visibility_of_element_located((By.NAME, 'login-field')))
-        password = wait.until(EC.visibility_of_element_located((By.NAME, 'login-password')))
-        try:
-            login_button = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="app"]/div[1]/div[1]/div/div[2]/fade/div/div/span/form/button')))
-        except:
-            login_button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[type="submit"]')))
-            
-        username.clear()
-        password.clear()
-        username.send_keys(user)
-        time.sleep(0.5)
-        password.send_keys(pwd)
-        time.sleep(0.5)
-        driver.execute_script("arguments[0].click();", login_button)
-        
-        # 登录验证码
-        try:
-            wait.until(EC.visibility_of_element_located((By.ID, 'tcaptcha_iframe_dy')))
-            logger.warning("触发验证码！")
-            driver.switch_to.frame("tcaptcha_iframe_dy")
-            process_captcha()
-        except TimeoutException:
-            logger.info("未触发验证码")
-        
-        time.sleep(5)
-        driver.switch_to.default_content()
-        
-        if "dashboard" in driver.current_url:
-            logger.info("登录成功！")
-            logger.info("正在转到赚取积分页")
-            
-            # --- 修复5：给点击操作增加稳定性 ---
-            for _ in range(3):
-                try:
-                    driver.get("https://app.rainyun.com/account/reward/earn")
-                    wait.until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
-                    time.sleep(3)
-
-                    try:
-                        # 限定在“每日签到”这一行查找对应的按钮/状态，避免其它行干扰
-                        claim_btns = driver.find_elements(By.XPATH, "//span[contains(text(),'每日签到')]/following::a[contains(@href,'/account/reward/earn')][1]")
-                        if any(el.is_displayed() for el in claim_btns):
-                            logger.info("检测到‘每日签到’行的‘领取奖励’，进入签到流程")
-                        else:
-                            completed = driver.find_elements(By.XPATH, "//span[contains(text(),'每日签到')]/following::span[contains(text(),'已完成')][1]")
-                            if any(el.is_displayed() for el in completed):
-                                logger.info("‘每日签到’显示已完成，跳过当前账号")
-                                try:
-                                    points_raw = driver.find_element(By.XPATH, '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[1]/div[1]/div/p/div/h3').get_attribute("textContent")
-                                    current_points = int(''.join(re.findall(r'\d+', points_raw)))
-                                except:
-                                    current_points = 0
-                                return True, user, current_points, None
-                    except Exception:
-                        pass
-
-                    strategies = [
-                        (By.XPATH, '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[2]/div/div/div/div[1]/div/div[1]/div/div[1]/div/span[2]/a'),
-                        (By.XPATH, '//a[contains(@href, "earn") and contains(text(), "赚取")]'),
-                        (By.CSS_SELECTOR, 'a[href*="earn"]')
-                    ]
-                    
-                    earn = None
-                    for by, selector in strategies:
-                        try:
-                            earn = wait.until(EC.element_to_be_clickable((by, selector)))
-                            break
-                        except: continue
-                    
-                    if earn:
-                        driver.execute_script("arguments[0].scrollIntoView(true);", earn)
-                        time.sleep(1)
-                        logger.info("点击赚取积分")
-                        driver.execute_script("arguments[0].click();", earn)
-                        
-                        # --- 核心修复：点击后等待，确保验证码 iframe 有时间加载 ---
-                        logger.info("等待验证码加载（如果有）...")
-                        
-                        try:
-                            WebDriverWait(driver, 15, poll_frequency=0.25).until(
-                                EC.visibility_of_element_located((By.ID, "tcaptcha_iframe_dy"))
-                            )
-                            wait.until(EC.frame_to_be_available_and_switch_to_it((By.ID, "tcaptcha_iframe_dy")))
-                            logger.info("处理验证码")
-                            process_captcha()
-                            driver.switch_to.default_content()
-                        except TimeoutException:
-                            logger.info("未触发验证码，继续")
-                            driver.switch_to.default_content()
-                        except Exception as e:
-                            logger.error(f"验证码处理过程出错: {e}")
-                            driver.switch_to.default_content()
-                        
-                        logger.info("赚取积分操作完成")
-                        break
-                    else:
-                        driver.refresh()
-                        time.sleep(3)
-                except Exception as e:
-                    logger.error(f"出错: {e}")
-                    time.sleep(3)
-            
-            driver.implicitly_wait(5)
-            # 简单的积分获取（不对比，保持原逻辑）
-            try:
-                points_raw = driver.find_element(By.XPATH, '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[1]/div[1]/div/p/div/h3').get_attribute("textContent")
-                current_points = int(''.join(re.findall(r'\d+', points_raw)))
-                logger.info(f"当前剩余积分: {current_points} | 约为 {current_points / 2000:.2f} 元")
-            except:
-                current_points = 0
-                
-            logger.info("任务执行成功！")
-            return True, user, current_points, None
-        else:
-            return False, user, 0, "登录失败"
-
+        slideBg = wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="slideBg"]')))
+        img1_style = slideBg.get_attribute("style")
+        img1_url = get_url_from_style(img1_style)
+        if img1_url:
+            logger.info("开始下载验证码图片(1): " + img1_url)
+            download_image(img1_url, "captcha.jpg")
     except Exception as e:
-        logger.error(f"异常: {str(e)}", exc_info=True)
-        return False, user, 0, str(e)
-    finally:
-        if driver:
-            try: driver.quit()
-            except: pass
+        logger.error(f"下载验证码背景图失败：{e}")
+    
+    # 下载滑块图
+    try:
+        sprite = wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="instruction"]/div/img')))
+        img2_url = sprite.get_attribute("src")
+        if img2_url:
+            logger.info("开始下载验证码图片(2): " + img2_url)
+            download_image(img2_url, "sprite.jpg")
+    except Exception as e:
+        logger.error(f"下载验证码滑块图失败：{e}")
+
 
 if __name__ == "__main__":
-    is_github_actions = os.environ.get("GITHUB_ACTIONS", "false") == "true"
-    debug = os.environ.get('DEBUG', 'false').lower() == 'true'
-    headless = os.environ.get('HEADLESS', 'false').lower() == 'true'
-    if is_github_actions: headless = True
-    
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    # 配置项
+    timeout = 20  # 延长超时时间（适配网络波动）
+    max_delay = 0  # 最大随机等待分钟数
+    user = "qwer2580"  # 替换为你的雨云用户名
+    pwd = "qwer2580"  # 替换为你的雨云密码
+    debug = False  # 调试模式（True时浏览器不自动关闭）
+    # linux = False  # 已改为自动识别系统，无需手动设置
+
+    # 初始化日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler()]
+    )
     logger = logging.getLogger(__name__)
     
-    ocr = None
-    det = None
-    wait = None
-
-    ver = "2.2 (Fix)"
+    # 版本信息
+    ver = "2.3"
     logger.info("------------------------------------------------------------------")
-    logger.info(f"雨云自动签到工作流 v{ver}")
+    logger.info(f"雨云签到工具 v{ver} by SerendipityR ~")
+    logger.info("Github发布页: https://github.com/SerendipityR-2022/Rainyun-Qiandao")
     logger.info("------------------------------------------------------------------")
     
-    accounts = []
-    users_env = os.environ.get("RAINYUN_USER", "")
-    passwords_env = os.environ.get("RAINYUN_PASS", "")
-    users = [user.strip() for user in users_env.split('\n') if user.strip()]
-    passwords = [pwd.strip() for pwd in passwords_env.split('\n') if pwd.strip()]
+    # 随机延时
+    delay = random.randint(0, max_delay)
+    delay_sec = random.randint(0, 6)
+    if not debug:
+        logger.info(f"随机延时等待 {delay} 分钟 {delay_sec} 秒")
+        time.sleep(delay * 60 + delay_sec)
     
-    if len(users) == len(passwords) and len(users) > 0:
-        for user, pwd in zip(users, passwords):
-            accounts.append((user, pwd))
-    else:
-        logger.error("未找到有效账户配置或数量不匹配")
+    # 初始化Selenium
+    logger.info("初始化 Selenium")
+    try:
+        driver = init_selenium()
+    except Exception as e:
+        logger.error(f"Selenium初始化失败：{e}")
+        logger.error("请检查ChromeDriver是否安装正确，或执行：apt install chromium chromium-driver")
         exit(1)
     
-    results = []
-    for i, (user, pwd) in enumerate(accounts, 1):
-        logger.info(f"\n=== 开始处理第 {i} 个账户: {user} ===")
-        result = sign_in_account(user, pwd, debug=debug, headless=headless)
-        results.append(result)
-        logger.info(f"=== 第 {i} 个账户处理完成 ===\n")
-    
-    # 生成统一通知
-    success_count = sum(1 for r in results if r[0])
-    total_count = len(results)
-    
-    if success_count == total_count:
-        notification_title = f"✅ 雨云自动签到完成 - 全部成功"
-    elif success_count > 0:
-        notification_title = f"⚠️ 雨云自动签到完成 - 部分成功 ({success_count}/{total_count})"
-    else:
-        notification_title = f"❌ 雨云自动签到完成 - 全部失败"
-    
-    notification_content = f"雨云自动签到结果汇总：\n\n总账户数: {total_count}\n成功账户数: {success_count}\n失败账户数: {total_count - success_count}\n\n详细结果：\n"
-    
-    for i, (success, user, points, error_msg) in enumerate(results, 1):
-        if success:
-            notification_content += f"{i}. ✅ {user}\n   积分: {points} | 约 {points / 2000:.2f} 元\n"
-        else:
-            notification_content += f"{i}. ❌ {user}\n   错误: {error_msg}\n"
-    
-    # 发送统一通知
+    # 绕过Selenium检测（需要确保stealth.min.js文件存在）
     try:
-        send(notification_title, notification_content)
-        logger.info("统一通知发送成功")
+        with open("stealth.min.js", mode="r", encoding="utf-8") as f:
+            js = f.read()
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": js})
+    except FileNotFoundError:
+        logger.warning("未找到stealth.min.js文件，可能无法绕过Selenium检测")
     except Exception as e:
-        logger.error(f"发送通知失败: {e}")
+        logger.warning(f"加载反检测脚本失败：{e}")
+    
+    # 登录流程
+    logger.info("发起登录请求")
+    driver.get("https://app.rainyun.com/auth/login")
+    wait = WebDriverWait(driver, timeout)
+    
+    try:
+        # 输入账号密码
+        username = wait.until(EC.visibility_of_element_located((By.NAME, 'login-field')))
+        password = wait.until(EC.visibility_of_element_located((By.NAME, 'login-password')))
+        login_button = wait.until(EC.element_to_be_clickable((By.XPATH,
+            '//*[@id="app"]/div[1]/div[1]/div/div[2]/fade/div/div/span/form/button')))
+        
+        username.send_keys(user)
+        password.send_keys(pwd)
+        time.sleep(random.uniform(0.5, 1.5))  # 模拟人类输入延时
+        login_button.click()
+    except TimeoutException:
+        logger.error("页面加载超时，请检查网络或延长timeout值！")
+        driver.quit()
+        exit(1)
+    
+    # 处理登录验证码
+    try:
+        login_captcha = wait.until(EC.visibility_of_element_located((By.ID, 'tcaptcha_iframe_dy')))
+        logger.warning("触发登录验证码！")
+        driver.switch_to.frame("tcaptcha_iframe_dy")
+        process_captcha()
+    except TimeoutException:
+        logger.info("未触发登录验证码")
+    except Exception as e:
+        logger.error(f"处理登录验证码异常：{e}")
+    
+    # 回到主页面
+    time.sleep(5)
+    driver.switch_to.default_content()
+    
+    # 验证登录是否成功
+    if driver.current_url == "https://app.rainyun.com/dashboard":
+        logger.info("登录成功！")
+        logger.info("正在转到赚取积分页")
+        driver.get("https://app.rainyun.com/account/reward/earn")
+        driver.implicitly_wait(5)
+        
+        # 点击赚取积分
+        try:
+            earn = wait.until(EC.element_to_be_clickable((By.XPATH,
+                '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[2]/div/div/div/div[1]/div/div[1]/div/div[1]/div/span[2]/a')))
+            logger.info("点击赚取积分")
+            earn.click()
+            time.sleep(2)
+            
+            # 处理赚取积分的验证码
+            try:
+                driver.switch_to.frame("tcaptcha_iframe_dy")
+                process_captcha()
+            except TimeoutException:
+                logger.info("赚取积分未触发验证码")
+            except Exception as e:
+                logger.error(f"处理赚取积分验证码异常：{e}")
+            
+            # 回到主页面，获取积分
+            driver.switch_to.default_content()
+            driver.implicitly_wait(5)
+            try:
+                points_raw = driver.find_element(By.XPATH,
+                    '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[1]/div[1]/div/p/div/h3').text
+                current_points = int(''.join(re.findall(r'\d+', points_raw)))
+                logger.info(f"当前剩余积分: {current_points} | 约为 {current_points / 2000:.2f} 元")
+            except Exception as e:
+                logger.error(f"获取积分失败：{e}")
+            
+            logger.info("任务执行成功！")
+        except Exception as e:
+            logger.error(f"赚取积分操作失败：{e}")
+    else:
+        logger.error("登录失败！请检查账号密码或验证码处理逻辑")
+    
+    # 关闭浏览器
+    if not debug:
+        time.sleep(3)
+        driver.quit()
+    logger.info("程序结束")
