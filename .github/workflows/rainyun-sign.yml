@@ -2,7 +2,7 @@ name: Rainyun 自动签到
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # UTC+8 8点执行
+    - cron: '0 2 * * *'  # UTC+8 12点执行
   workflow_dispatch:  # 允许手动触发
 
 jobs:
@@ -44,7 +44,7 @@ jobs:
       
       - name: 执行签到脚本
        # 开启debug查看完整过程
-        run: DEBUG=true HEADLESS=false python rainyun.py python rainyun.py
+        run: python rainyun.py
         env:
           # 请在GitHub仓库的Settings > Secrets and variables > Actions中设置这些密钥
           RAINYUN_USER: ${{ secrets.RAINYUN_USER }}
@@ -79,11 +79,10 @@ jobs:
           
           # 设置无头模式环境变量
           HEADLESS: "true"
+          GITHUB_ACTIONS: "true"
           # 启用调试日志
           DEBUG: "false"
-          # 确保使用系统路径中的ChromeDriver
-          CHROMEDRIVER_PATH: "chromedriver"
-      
+          
       - name: 清理临时文件
         run: rm -rf temp
         if: always()  # 即使前面步骤失败也执行清理
