@@ -1,1 +1,5 @@
 /.env
+__pycache__/
+cookies/
+temp/
+e-main/
