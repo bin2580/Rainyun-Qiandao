@@ -1,279 +1,425 @@
 import logging
 import os
 import random
-import re
-import stat
 import time
+import sys
+import threading
+import json
+import hashlib
+import re
+import subprocess
+from datetime import datetime, timedelta
 
-import cv2
-import requests
-from selenium import webdriver
-from selenium.common import TimeoutException
-from selenium.webdriver import ActionChains
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.webdriver import WebDriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.wait import WebDriverWait
+selenium_modules = None
 
-import ICR
+def import_selenium_modules():
+    global selenium_modules
+    if selenium_modules is None:
+        from selenium import webdriver
+        from selenium.webdriver import ActionChains
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
+        from selenium.webdriver.chrome.webdriver import WebDriver
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.webdriver.support.wait import WebDriverWait
+        from selenium.common import TimeoutException
+        
+        selenium_modules = {
+            'webdriver': webdriver,
+            'ActionChains': ActionChains,
+            'Options': Options,
+            'Service': Service,
+            'WebDriver': WebDriver,
+            'By': By,
+            'EC': EC,
+            'WebDriverWait': WebDriverWait,
+            'TimeoutException': TimeoutException
+        }
+    return selenium_modules
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
+def unload_selenium_modules():
+    global selenium_modules
+    if selenium_modules is not None:
+        modules_to_remove = [
+            'selenium',
+            'selenium.webdriver',
+            'selenium.webdriver.chrome',
+            'selenium.webdriver.chrome.options',
+            'selenium.webdriver.chrome.service',
+            'selenium.webdriver.chrome.webdriver',
+            'selenium.webdriver.common',
+            'selenium.webdriver.common.by',
+            'selenium.webdriver.support',
+            'selenium.webdriver.support.expected_conditions',
+            'selenium.webdriver.support.wait',
+            'selenium.common'
+        ]
+        
+        for module in modules_to_remove:
+            if module in sys.modules:
+                del sys.modules[module]
+        
+        selenium_modules = None
 
-try:
-    from webdriver_manager.chrome import ChromeDriverManager
-    try:
-        from webdriver_manager.core.utils import ChromeType
-    except ImportError:
-        try:
-            from webdriver_manager.chrome import ChromeType
-        except ImportError:
-            ChromeType = None
-except ImportError:
-    print("webdriver_manager未安装，将使用备用方式")
-    ChromeDriverManager = None
-    ChromeType = None
-
-try:
-    from notify import send
-    print("已加载通知模块 (notify.py)")
-except ImportError:
-    print("警告: 未找到 notify.py，将无法发送通知。")
-    def send(*args, **kwargs):
-        pass
-
-AD_URL = os.environ.get("AD_URL", "https://scfc.dpdns.org/ad.json")
-
-AD_TEXT = None
-AD_LINK = None
-AD_ENABLED = True
-AD_LIST = None
-MIN_VERSION = None
-LATEST_VERSION = None
-UPDATE_URL = None
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-def fetch_remote_ad():
-    global AD_TEXT, AD_LINK, AD_ENABLED, AD_LIST, MIN_VERSION, LATEST_VERSION, UPDATE_URL
-    if not AD_URL:
-        return
-    try:
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        response = requests.get(AD_URL, timeout=5, proxies={"http": None, "https": None}, verify=False)
-        if response.status_code == 200:
-            import json
-            ad_data = json.loads(response.text)
-            
-            if "enabled" in ad_data:
-                AD_ENABLED = ad_data["enabled"]
-            
-            if "min_version" in ad_data:
-                MIN_VERSION = ad_data["min_version"]
-            
-            if "latest_version" in ad_data:
-                LATEST_VERSION = ad_data["latest_version"]
-            
-            if "update_url" in ad_data:
-                UPDATE_URL = ad_data["update_url"].strip().strip('`').strip("'").strip('"')
-            
-            if "ads" in ad_data and isinstance(ad_data["ads"], list):
-                AD_LIST = ad_data["ads"]
-            else:
-                if "text" in ad_data:
-                    AD_TEXT = ad_data["text"]
-                if "link" in ad_data:
-                    AD_LINK = ad_data["link"]
-        else:
-            print(f"⚠️ 远程获取失败，状态码: {response.status_code}")
-    except Exception as e:
-        print(f"⚠️ 远程获取异常: {e}")
-
-
-fetch_remote_ad()
-
-
-def auto_update(current_ver):
-    global LATEST_VERSION, UPDATE_URL
-    if not LATEST_VERSION or LATEST_VERSION == current_ver:
-        return
+def setup_sigchld_handler():
+    import signal
     
-    print(f"🔄 开始自动更新到 v{LATEST_VERSION}...")
+    def sigchld_handler(signum, frame):
+        while True:
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    break
+            except ChildProcessError:
+                break
+            except Exception:
+                break
     
+    if os.name == 'posix':
+        signal.signal(signal.SIGCHLD, sigchld_handler)
+        logger.info("已设置子进程自动回收机制")
+
+def cleanup_zombie_processes():
     try:
-        import subprocess
-        import shutil
-        
-        git_path = shutil.which('git')
-        if not git_path:
-            print("⚠️ 未找到 git，尝试直接下载...")
-            download_update()
-            return
-        
-        print(f"📥 正在使用 git 同步最新版本...")
-        
-        subprocess.run(['git', 'fetch', '--all'], check=True, capture_output=True, text=True)
-        subprocess.run(['git', 'reset', '--hard', 'origin/main'], check=True, capture_output=True, text=True)
-        
-        print(f"✅ 更新完成！已同步到 v{LATEST_VERSION}")
-        print(f"📝 请重新运行脚本以使用新版本")
-        exit(0)
-    except subprocess.CalledProcessError as e:
-        print(f"❌ git 同步失败: {e}")
-        print(f"📥 尝试直接下载...")
-        download_update()
+        if os.name == 'posix':
+            try:
+                result = subprocess.run(['pgrep', '-f', 'chrome|chromedriver'], 
+                                      capture_output=True, text=True, timeout=5)
+                if result.stdout:
+                    pids = result.stdout.strip().split('\n')
+                    zombie_count = 0
+                    
+                    for pid in pids:
+                        if pid:
+                            try:
+                                stat_result = subprocess.run(['ps', '-p', pid, '-o', 'stat='], 
+                                                           capture_output=True, text=True, timeout=2)
+                                if 'Z' in stat_result.stdout:
+                                    zombie_count += 1
+                            except:
+                                pass
+                    
+                    if zombie_count > 0:
+                        logger.info(f"检测到 {zombie_count} 个僵尸进程")
+                        subprocess.run(['pkill', '-9', '-f', 'chrome.*--type='], 
+                                     timeout=5, stderr=subprocess.DEVNULL)
+            except:
+                pass
     except Exception as e:
-        print(f"❌ 自动更新失败: {e}")
-        if UPDATE_URL:
-            print(f"📥 请手动更新: {UPDATE_URL}")
+        logger.debug(f"僵尸进程清理失败: {e}")
 
+def get_random_user_agent(account_id: str) -> str:
+    import datetime
+    base_date = datetime.date(2022, 3, 29)
+    base_version = 100
+    days_diff = (datetime.date.today() - base_date).days
+    current_ver = base_version + (days_diff // 32)
+    
+    user_agents = [
+        f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{current_ver}.0.0.0 Safari/537.36",
+        f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{current_ver-1}.0.0.0 Safari/537.36",
+        f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{current_ver-2}.0.0.0 Safari/537.36",
+    ]
+    
+    account_hash = hashlib.md5(account_id.encode()).hexdigest()
+    seed = int(account_hash[:8], 16)
+    rng = random.Random(seed)
+    return rng.choice(user_agents)
 
-def download_update():
-    global LATEST_VERSION, UPDATE_URL
-    try:
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+def generate_fingerprint_script(account_id: str):
+    account_hash = hashlib.md5(account_id.encode()).hexdigest()
+    seed = int(account_hash[:8], 16)
+    rng = random.Random(seed)
+    
+    webgl_vendors = [
+        ("Intel Inc.", "Intel Iris Xe Graphics"),
+        ("Intel Inc.", "Intel UHD Graphics 770"),
+        ("NVIDIA Corporation", "NVIDIA GeForce RTX 4070/PCIe/SSE2"),
+        ("NVIDIA Corporation", "NVIDIA GeForce RTX 3060/PCIe/SSE2"),
+        ("AMD", "AMD Radeon RX 7800 XT"),
+    ]
+    vendor, renderer = rng.choice(webgl_vendors)
+    
+    hardware_concurrency = rng.choice([4, 6, 8, 12, 16])
+    device_memory = rng.choice([8, 16, 32])
+    languages = [["zh-CN", "zh"], ["zh-CN", "en-US"]]
+    language = rng.choice(languages)
+    canvas_noise_seed = rng.randint(1, 1000000)
+    audio_noise = rng.uniform(0.00001, 0.0001)
+    plugins_length = rng.randint(0, 5)
+    
+    fingerprint_script = f"""
+    (function() {{
+        'use strict';
         
-        repo_url = "https://github.com/scfcn/Rainyun-Qiandao"
-        raw_url = f"{repo_url}/raw/main/rainyun.py"
+        const getParameterProxyHandler = {{
+            apply: function(target, thisArg, args) {{
+                const param = args[0];
+                if (param === 37445) return '{vendor}';
+                if (param === 37446) return '{renderer}';
+                return Reflect.apply(target, thisArg, args);
+            }}
+        }};
         
-        print(f"📥 正在下载最新版本...")
-        response = requests.get(raw_url, timeout=30, proxies={"http": None, "https": None}, verify=False)
+        try {{
+            const originalGetParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = new Proxy(originalGetParameter, getParameterProxyHandler);
+        }} catch(e) {{}}
         
-        if response.status_code == 200:
-            new_content = response.text
-            
-            with open(__file__, 'w', encoding='utf-8') as f:
-                f.write(new_content)
-            
-            print(f"✅ 更新完成！已更新到 v{LATEST_VERSION}")
-            print(f"📝 请重新运行脚本以使用新版本")
-            exit(0)
-        else:
-            print(f"❌ 下载失败，状态码: {response.status_code}")
-            if UPDATE_URL:
-                print(f"📥 请手动更新: {UPDATE_URL}")
-    except Exception as e:
-        print(f"❌ 下载失败: {e}")
-        if UPDATE_URL:
-            print(f"📥 请手动更新: {UPDATE_URL}")
+        try {{
+            const originalGetParameter2 = WebGL2RenderingContext.prototype.getParameter;
+            WebGL2RenderingContext.prototype.getParameter = new Proxy(originalGetParameter2, getParameterProxyHandler);
+        }} catch(e) {{}}
+        
+        const noiseSeed = {canvas_noise_seed};
+        function seededRandom(seed) {{
+            const x = Math.sin(seed) * 10000;
+            return x - Math.floor(x);
+        }}
+        
+        const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
+        HTMLCanvasElement.prototype.toDataURL = function(type, quality) {{
+            const canvas = this;
+            const ctx = canvas.getContext('2d');
+            if (ctx) {{
+                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                const data = imageData.data;
+                for (let i = 0; i < data.length; i += 4) {{
+                    if (seededRandom(noiseSeed + i) < 0.01) {{
+                        data[i] = data[i] ^ 1;
+                        data[i+1] = data[i+1] ^ 1;
+                    }}
+                }}
+                ctx.putImageData(imageData, 0, 0);
+            }}
+            return originalToDataURL.apply(this, arguments);
+        }};
+        
+        const audioNoise = {audio_noise};
+        if (window.OfflineAudioContext) {{
+            const originalGetChannelData = AudioBuffer.prototype.getChannelData;
+            AudioBuffer.prototype.getChannelData = function(channel) {{
+                const result = originalGetChannelData.call(this, channel);
+                for (let i = 0; i < result.length; i += 100) {{
+                    const noise = Math.sin({canvas_noise_seed} + i) * audioNoise;
+                    result[i] = result[i] + noise;
+                }}
+                return result;
+            }};
+        }}
+        
+        Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {hardware_concurrency} }});
+        Object.defineProperty(navigator, 'deviceMemory', {{ get: () => {device_memory} }});
+        Object.defineProperty(navigator, 'languages', {{ get: () => {language} }});
+        Object.defineProperty(navigator, 'language', {{ get: () => '{language[0]}' }});
+        Object.defineProperty(navigator, 'plugins', {{
+            get: () => {{
+                return {{ length: {plugins_length}, item: () => null, namedItem: () => null, refresh: () => {{}}, [Symbol.iterator]: function* () {{}} }};
+            }}
+        }});
+        Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
+        window.chrome = {{ runtime: {{}}, loadTimes: function() {{}}, csi: function() {{}}, app: {{}} }};
+    }})();
+    """
+    return fingerprint_script
 
-
-def init_selenium(debug=False, headless=False) -> WebDriver:
+def init_selenium(account_id: str, proxy: str = None):
+    modules = import_selenium_modules()
+    webdriver = modules['webdriver']
+    Options = modules['Options']
+    Service = modules['Service']
+    
     ops = Options()
-    if headless or os.environ.get("GITHUB_ACTIONS", "false") == "true":
-        for option in ['--headless', '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']:
-            ops.add_argument(option)
-    ops.add_argument('--window-size=1920,1080')
-    ops.add_argument('--disable-blink-features=AutomationControlled')
-    ops.add_argument('--no-proxy-server')
-    ops.add_argument('--lang=zh-CN')
+    ops.add_argument("--no-sandbox")
+    ops.add_argument("--disable-dev-shm-usage")
+    ops.add_argument("--disable-extensions")
+    ops.add_argument("--disable-plugins")
     
-    is_github_actions = os.environ.get("GITHUB_ACTIONS", "false") == "true"
-    if debug and not is_github_actions:
+    if proxy:
+        ops.add_argument(f"--proxy-server=http://{proxy}")
+        logger.info(f"浏览器已配置代理: {proxy}")
+    
+    user_agent = get_random_user_agent(account_id)
+    ops.add_argument(f"--user-agent={user_agent}")
+    logger.info(f"使用 User-Agent: {user_agent[:50]}...")
+    
+    if debug:
         ops.add_experimental_option("detach", True)
     
-    try:
-        if ChromeDriverManager:
-            if ChromeType and hasattr(ChromeType, 'GOOGLE'):
-                manager = ChromeDriverManager(chrome_type=ChromeType.GOOGLE)
-            else:
-                manager = ChromeDriverManager()
-            driver_path = manager.install()
-            
-            if os.path.isfile(driver_path):
-                filename = os.path.basename(driver_path)
-                if 'chromedriver' in filename.lower() and 'THIRD_PARTY_NOTICES' not in filename:
-                    os.chmod(driver_path, os.stat(driver_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-                    service = Service(driver_path)
-                    driver = webdriver.Chrome(service=service, options=ops)
-                    return driver
-            
-            if os.path.isdir(driver_path):
-                driver_dir = driver_path
-            else:
-                driver_dir = os.path.dirname(driver_path)
-            
-            chromedriver_path = os.path.join(driver_dir, 'chromedriver')
-            if os.path.isfile(chromedriver_path):
-                os.chmod(chromedriver_path, os.stat(chromedriver_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-                service = Service(chromedriver_path)
-                driver = webdriver.Chrome(service=service, options=ops)
-                return driver
-            
-            for root, dirs, files in os.walk(driver_dir):
-                if root.endswith('chromedriver-linux64'):
-                    for file in files:
-                        if file == 'chromedriver':
-                            correct_path = os.path.join(root, file)
-                            os.chmod(correct_path, os.stat(correct_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-                            service = Service(correct_path)
-                            driver = webdriver.Chrome(service=service, options=ops)
-                            return driver
-    except Exception as e:
-        print(f"webdriver-manager失败: {e}")
-
-    try:
-        driver = webdriver.Chrome(options=ops)
-        return driver
-    except Exception:
-        pass
+    ops.add_argument("--window-size=1920,1080")
+    
+    if linux:
+        ops.add_argument("--headless")
+        ops.add_argument("--disable-gpu")
+        chromedriver_path = "/usr/bin/chromedriver"
         
-    raise Exception("无法初始化Selenium WebDriver")
+        if os.path.exists(chromedriver_path):
+            logger.info(f"使用 Docker 镜像的 ChromeDriver: {chromedriver_path}")
+            service = Service(chromedriver_path)
+        else:
+            logger.info("使用 Selenium Manager 自动管理 ChromeDriver")
+            service = Service()
+        
+        return webdriver.Chrome(service=service, options=ops)
+    else:
+        service = Service()
+        return webdriver.Chrome(service=service, options=ops)
 
+def dismiss_modal_confirm(driver, timeout):
+    modules = import_selenium_modules()
+    WebDriverWait = modules['WebDriverWait']
+    EC = modules['EC']
+    By = modules['By']
+    TimeoutException = modules['TimeoutException']
 
-def download_image(url, filename):
-    os.makedirs("temp", exist_ok=True)
+    wait = WebDriverWait(driver, min(timeout, 5))
     try:
-        response = requests.get(url, timeout=10, proxies={"http": None, "https": None}, verify=False)
-        if response.status_code == 200:
-            with open(os.path.join("temp", filename), "wb") as f:
-                f.write(response.content)
+        confirm = wait.until(
+            EC.element_to_be_clickable(
+                (By.XPATH, "//footer[contains(@id,'modal') and contains(@id,'footer')]//button[contains(normalize-space(.), '确认')]")
+            )
+        )
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", confirm)
+        except Exception:
+            pass
+        time.sleep(0.2)
+        confirm.click()
+        logger.info("已关闭弹窗：确认")
+        time.sleep(0.5)
+        return True
+    except TimeoutException:
+        return False
+    except Exception:
+        try:
+            confirm = driver.find_element(By.XPATH, "//button[contains(normalize-space(.), '确认') and contains(@class,'btn')]")
+            driver.execute_script("arguments[0].click();", confirm)
+            logger.info("已关闭弹窗：确认")
+            time.sleep(0.5)
             return True
-        return False
+        except Exception:
+            return False
+
+def wait_captcha_or_modal(driver, timeout):
+    modules = import_selenium_modules()
+    WebDriverWait = modules['WebDriverWait']
+    EC = modules['EC']
+    By = modules['By']
+    TimeoutException = modules['TimeoutException']
+
+    def find_visible_tcaptcha_iframe():
+        try:
+            iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[id^='tcaptcha_iframe']")
+        except Exception:
+            return None
+        for fr in iframes:
+            try:
+                if fr.is_displayed() and fr.size.get("width", 0) > 0 and fr.size.get("height", 0) > 0:
+                    return fr
+            except Exception:
+                continue
+        return None
+
+    end_time = time.time() + min(timeout, 8)
+    while time.time() < end_time:
+        if dismiss_modal_confirm(driver, timeout):
+            return "modal"
+        try:
+            iframe = find_visible_tcaptcha_iframe()
+            if iframe:
+                return "captcha"
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return "none"
+
+def save_cookies(driver, account_id):
+    if not account_id:
+        return
+    os.makedirs("temp/cookies", exist_ok=True)
+    account_hash = hashlib.md5(account_id.encode()).hexdigest()[:16]
+    cookie_path = os.path.join("temp", "cookies", f"{account_hash}.json")
+    
+    try:
+        cookies = driver.get_cookies()
+        with open(cookie_path, 'w', encoding='utf-8') as f:
+            json.dump(cookies, f, ensure_ascii=False)
+        logger.info("Cookie 已保存到本地")
     except Exception as e:
-        logger.error(f"下载图片异常: {str(e)}")
+        logger.warning(f"保存 Cookie 失败: {e}")
+
+def load_cookies(driver, account_id):
+    if not account_id:
         return False
-
-
-def get_url_from_style(style):
-    return re.search(r'url\(["\']?(.*?)["\']?\)', style).group(1)
-
-
-def get_width_from_style(style):
-    return re.search(r'width:\s*([\d.]+)px', style).group(1)
-
-
-def get_height_from_style(style):
-    return re.search(r'height:\s*([\d.]+)px', style).group(1)
-
+    account_hash = hashlib.md5(account_id.encode()).hexdigest()[:16]
+    cookie_path = os.path.join("temp", "cookies", f"{account_hash}.json")
+    
+    if not os.path.exists(cookie_path):
+        logger.info("未找到本地 Cookie，将使用账号密码登录")
+        return False
+    
+    try:
+        with open(cookie_path, 'r', encoding='utf-8') as f:
+            cookies = json.load(f)
+        
+        driver.get("https://app.rainyun.com/")
+        time.sleep(1)
+        
+        for cookie in cookies:
+            if 'expiry' in cookie:
+                cookie['expiry'] = int(cookie['expiry'])
+            try:
+                driver.add_cookie(cookie)
+            except Exception:
+                pass
+        
+        logger.info("已加载本地 Cookie")
+        return True
+    except Exception as e:
+        logger.warning(f"加载 Cookie 失败: {e}")
+        return False
 
 def process_captcha(driver, wait):
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.wait import WebDriverWait
+    from selenium.common.exceptions import TimeoutException
+    import ICR
+    
     try:
-        download_captcha_img(driver, wait)
-        logger.info("开始识别验证码")
-        captcha = cv2.imread("temp/captcha.jpg")
-        result = ICR.main("temp/captcha.jpg", "temp/sprite.jpg")
-        for info in result:
-            rect = info['bg_rect']
-            x, y = int(rect[0] + (rect[2] / 2)), int(rect[1] + (rect[3] / 2))
-            logger.info(f"图案 {info['sprite_idx'] + 1} 位于 ({x}, {y})")
+        wait.until(EC.presence_of_element_located((By.ID, "slideBg")))
+    except TimeoutException:
+        logger.info("未检测到可处理验证码内容，跳过验证码处理")
+        return
+
+    download_captcha_img(driver, wait)
+    
+    positions = ICR.find_part_positions("temp/captcha.jpg", "temp/sprite.jpg", 'template')
+    
+    if positions:
+        logger.info(f"识别到 {len(positions)} 个图案位置")
+        
+        for i, (x, y) in enumerate(positions):
+            logger.info(f"图案 {i + 1} 位于 ({int(x)}, {int(y)})")
             slideBg = wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="slideBg"]')))
             style = slideBg.get_attribute("style")
-            width_raw, height_raw = captcha.shape[1], captcha.shape[0]
-            width, height = float(get_width_from_style(style)), float(get_height_from_style(style))
-            x_offset, y_offset = float(-width / 2), float(-height / 2)
-            final_x, final_y = int(x_offset + x / width_raw * width), int(y_offset + y / height_raw * height)
+            
+            import re
+            bg_width = float(re.search(r'width:\s*([\d.]+)px', style).group(1))
+            bg_height = float(re.search(r'height:\s*([\d.]+)px', style).group(1))
+            
+            import cv2
+            captcha = cv2.imread("temp/captcha.jpg")
+            raw_w, raw_h = captcha.shape[1], captcha.shape[0]
+            
+            final_x = int(x / raw_w * bg_width - bg_width / 2)
+            final_y = int(y / raw_h * bg_height - bg_height / 2)
+            
+            from selenium.webdriver import ActionChains
             ActionChains(driver).move_to_element_with_offset(slideBg, final_x, final_y).click().perform()
-        confirm = wait.until(
-            EC.element_to_be_clickable((By.XPATH, '//*[@id="tcStatus"]/div[2]/div[2]/div/div')))
+        
+        confirm = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="tcStatus"]/div[2]/div[2]/div/div')))
         logger.info("提交验证码")
         confirm.click()
         time.sleep(5)
@@ -283,316 +429,411 @@ def process_captcha(driver, wait):
             return
         else:
             logger.error("验证码未通过，正在重试")
-        reload = driver.find_element(By.XPATH, '//*[@id="reload"]')
-        time.sleep(5)
-        reload.click()
-        time.sleep(5)
-        process_captcha(driver, wait)
-    except TimeoutException:
-        logger.error("获取验证码图片失败")
-
+    else:
+        logger.error("验证码识别失败，正在重试")
+    
+    reload = driver.find_element(By.XPATH, '//*[@id="reload"]')
+    time.sleep(5)
+    reload.click()
+    time.sleep(5)
+    process_captcha(driver, wait)
 
 def download_captcha_img(driver, wait):
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.wait import WebDriverWait
+    
     if os.path.exists("temp"):
         for filename in os.listdir("temp"):
             file_path = os.path.join("temp", filename)
             if os.path.isfile(file_path) or os.path.islink(file_path):
                 os.remove(file_path)
+    
+    try:
+        current_ua = driver.execute_script("return navigator.userAgent;")
+    except Exception:
+        current_ua = None
+    
     slideBg = wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="slideBg"]')))
     img1_style = slideBg.get_attribute("style")
     img1_url = get_url_from_style(img1_style)
     logger.info("开始下载验证码图片(1): " + img1_url)
-    download_image(img1_url, "captcha.jpg")
+    download_image(img1_url, "captcha.jpg", user_agent=current_ua)
+    
     sprite = wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="instruction"]/div/img')))
     img2_url = sprite.get_attribute("src")
     logger.info("开始下载验证码图片(2): " + img2_url)
-    download_image(img2_url, "sprite.jpg")
+    download_image(img2_url, "sprite.jpg", user_agent=current_ua)
 
-
-def sign_in_account(user, pwd, debug=False, headless=False):
-    timeout = 15
-    driver = None
+def download_image(url, filename, user_agent=None):
+    import requests
+    
+    os.makedirs("temp", exist_ok=True)
+    
+    headers = {}
+    if user_agent:
+        headers['User-Agent'] = user_agent
     
     try:
-        if not debug:
-            time.sleep(random.randint(5, 10))
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            path = os.path.join("temp", filename)
+            with open(path, "wb") as f:
+                f.write(response.content)
+            return True
+        else:
+            logger.error(f"下载图片失败！状态码: {response.status_code}")
+            return False
+    except Exception as e:
+        logger.error(f"下载图片异常: {e}")
+        return False
+
+def get_url_from_style(style):
+    import re
+    return re.search(r'url\(["\']?(.*?)["\']?\)', style).group(1)
+
+def run_checkin(account_user=None, account_pwd=None):
+    modules = import_selenium_modules()
+    webdriver = modules['webdriver']
+    ActionChains = modules['ActionChains']
+    By = modules['By']
+    EC = modules['EC']
+    WebDriverWait = modules['WebDriverWait']
+    TimeoutException = modules['TimeoutException']
+    
+    current_user = account_user or user
+    current_pwd = account_pwd or pwd
+    driver = None
+    retry_stats = {'count': 0}
+
+    masked_user = f"{current_user[:3]}***{current_user[-3:] if len(current_user) > 6 else current_user}"
+    
+    class PrefixAdapter(logging.LoggerAdapter):
+        def process(self, msg, kwargs):
+            return '[%s] %s' % (self.extra['prefix'], msg), kwargs
+
+    logger_adapter = PrefixAdapter(logger, {'prefix': masked_user})
+    
+    try:
+        logger_adapter.info(f"开始执行签到任务...")
         
-        driver = init_selenium(debug=debug, headless=headless)
+        logger_adapter.info("初始化 Selenium（账号专属配置）")
+        driver = init_selenium(current_user)
         
-        try:
-            with open("stealth.min.js", mode="r") as f: js = f.read()
-            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": js})
-        except: pass
+        with open("stealth.min.js", mode="r") as f:
+            js = f.read()
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": js})
         
-        driver.get("https://app.rainyun.com/auth/login")
+        fingerprint_js = generate_fingerprint_script(current_user)
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": fingerprint_js})
+        logger_adapter.info("已注入浏览器指纹脚本（账号专属指纹）")
+        
         wait = WebDriverWait(driver, timeout)
         
-        username = wait.until(EC.visibility_of_element_located((By.NAME, 'login-field')))
-        password = wait.until(EC.visibility_of_element_located((By.NAME, 'login-password')))
-        try:
-            login_button = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="app"]/div[1]/div[1]/div/div[2]/fade/div/div/span/form/button')))
-        except:
-            login_button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[type="submit"]')))
+        load_cookies(driver, current_user)
+        logger_adapter.info("正在跳转积分页...")
+        driver.get("https://app.rainyun.com/account/reward/earn")
+        time.sleep(3)
+        
+        if "/auth/login" in driver.current_url:
+            logger_adapter.info("Cookie 已失效，使用账号密码登录")
             
-        username.clear()
-        password.clear()
-        username.send_keys(user)
-        logger.info(f"已输入用户名: {user}")
-        time.sleep(0.5)
-        password.send_keys(pwd)
-        logger.info("已输入密码")
-        time.sleep(0.5)
-        driver.execute_script("arguments[0].click();", login_button)
-        logger.info("已点击登录按钮")
-        
-        try:
-            wait.until(EC.visibility_of_element_located((By.ID, 'tcaptcha_iframe_dy')))
-            logger.warning("触发验证码")
-            driver.switch_to.frame("tcaptcha_iframe_dy")
-            process_captcha(driver, wait)
-        except TimeoutException:
-            logger.info("未触发验证码")
-            pass
-        
-        time.sleep(5)
-        driver.switch_to.default_content()
-        
-        current_url = driver.current_url
-        logger.info(f"当前URL: {current_url}")
-        
-        if "dashboard" in current_url or ("app.rainyun.com" in current_url and "login" not in current_url):
-            logger.info("登录成功")
-            
-            for _ in range(3):
-                try:
-                    driver.get("https://app.rainyun.com/account/reward/earn")
-                    wait.until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
-                    time.sleep(3)
-
-                    try:
-                        claim_btns = driver.find_elements(By.XPATH, "//span[contains(text(),'每日签到')]/following::a[contains(@href,'/account/reward/earn')][1]")
-                        if any(el.is_displayed() for el in claim_btns):
-                            logger.info("开始签到")
-                        else:
-                            completed = driver.find_elements(By.XPATH, "//span[contains(text(),'每日签到')]/following::span[contains(text(),'已完成')][1]")
-                            if any(el.is_displayed() for el in completed):
-                                logger.info("今日已签到")
-                                try:
-                                    points_raw = driver.find_element(By.XPATH, '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[1]/div[1]/div/p/div/h3').get_attribute("textContent")
-                                    current_points = int(''.join(re.findall(r'\d+', points_raw)))
-                                except:
-                                    current_points = 0
-                                return True, user, current_points, None
-                    except Exception:
-                        pass
-
-                    strategies = [
-                        (By.XPATH, '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[2]/div/div/div/div[1]/div/div[1]/div/div[1]/div/span[2]/a'),
-                        (By.XPATH, '//a[contains(@href, "earn") and contains(text(), "赚取")]'),
-                        (By.CSS_SELECTOR, 'a[href*="earn"]')
-                    ]
-                    
-                    earn = None
-                    for by, selector in strategies:
-                        try:
-                            earn = wait.until(EC.element_to_be_clickable((by, selector)))
-                            break
-                        except: continue
-                    
-                    if earn:
-                        driver.execute_script("arguments[0].scrollIntoView(true);", earn)
-                        time.sleep(1)
-                        driver.execute_script("arguments[0].click();", earn)
-                        
-                        try:
-                            WebDriverWait(driver, 15, poll_frequency=0.25).until(
-                                EC.visibility_of_element_located((By.ID, "tcaptcha_iframe_dy"))
-                            )
-                            wait.until(EC.frame_to_be_available_and_switch_to_it((By.ID, "tcaptcha_iframe_dy")))
-                            process_captcha(driver, wait)
-                            driver.switch_to.default_content()
-                        except TimeoutException:
-                            driver.switch_to.default_content()
-                        except Exception as e:
-                            logger.error(f"验证码错误: {e}")
-                            driver.switch_to.default_content()
-                        
-                        logger.info("签到完成")
-                        break
-                    else:
-                        driver.refresh()
-                        time.sleep(3)
-                except Exception as e:
-                    logger.error(f"出错: {e}")
-                    time.sleep(3)
-            
-            driver.implicitly_wait(5)
             try:
-                points_raw = driver.find_element(By.XPATH, '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[1]/div[1]/div/p/div/h3').get_attribute("textContent")
-                current_points = int(''.join(re.findall(r'\d+', points_raw)))
-                logger.info(f"积分: {current_points} ({current_points / 2000:.2f}元)")
-            except:
-                current_points = 0
-                
-            return True, user, current_points, None
+                username = wait.until(EC.visibility_of_element_located((By.NAME, 'login-field')))
+                password = wait.until(EC.visibility_of_element_located((By.NAME, 'login-password')))
+                login_button = wait.until(EC.visibility_of_element_located((By.XPATH,
+                    '//*[@id="app"]/div[1]/div[1]/div/div[2]/fade/div/div/span/form/button')))
+                username.send_keys(current_user)
+                password.send_keys(current_pwd)
+                login_button.click()
+            except TimeoutException:
+                logger_adapter.error("页面加载超时")
+                return {
+                    'status': False, 'msg': '页面加载超时', 'points': 0,
+                    'username': masked_user,
+                    'retries': retry_stats['count']
+                }
+            
+            try:
+                login_captcha = wait.until(EC.visibility_of_element_located((By.ID, 'tcaptcha_iframe_dy')))
+                logger_adapter.warning("触发验证码！")
+                driver.switch_to.frame("tcaptcha_iframe_dy")
+                process_captcha(driver, wait)
+            except TimeoutException:
+                logger_adapter.info("未触发验证码")
+            
+            time.sleep(5)
+            driver.switch_to.default_content()
+            dismiss_modal_confirm(driver, timeout)
+            
+            if "/dashboard" in driver.current_url or "/account" in driver.current_url:
+                logger_adapter.info("登录成功！")
+                save_cookies(driver, current_user)
+                driver.get("https://app.rainyun.com/account/reward/earn")
+                time.sleep(2)
+            else:
+                logger_adapter.error(f"登录失败，当前页面: {driver.current_url}")
+                return {
+                    'status': False, 'msg': '登录失败', 'points': 0,
+                    'username': masked_user,
+                    'retries': retry_stats['count']
+                }
         else:
-            logger.error("登录失败")
-            return False, user, 0, "登录失败"
+            logger_adapter.info("Cookie 有效，免密登录成功！")
+        
+        if "/account/reward/earn" not in driver.current_url:
+            driver.get("https://app.rainyun.com/account/reward/earn")
 
+        driver.implicitly_wait(5)
+        time.sleep(1)
+        dismiss_modal_confirm(driver, timeout)
+        dismiss_modal_confirm(driver, timeout)
+        
+        earn = driver.find_element(By.XPATH,
+                                   '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[2]/div/div/div/div[1]/div/div[1]/div/div[1]/div/span[2]/a')
+        btn_text = earn.text.strip()
+        logger_adapter.info(f"签到按钮文字: [{btn_text}]")
+        
+        if btn_text == "领取奖励":
+            logger_adapter.info("点击领取奖励")
+            earn.click()
+            state = wait_captcha_or_modal(driver, timeout)
+            if state == "captcha":
+                logger_adapter.info("处理验证码")
+                try:
+                    captcha_iframe = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "iframe[id^='tcaptcha_iframe']")))
+                    driver.switch_to.frame(captcha_iframe)
+                    process_captcha(driver, wait)
+                finally:
+                    driver.switch_to.default_content()
+                driver.implicitly_wait(5)
+            else:
+                logger_adapter.info("未触发验证码")
+        else:
+            logger_adapter.info(f"今日已签到（按钮显示: {btn_text}）")
+
+        points_raw = driver.find_element(By.XPATH,
+                                         '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[1]/div[1]/div/p/div/h3').get_attribute("textContent")
+        current_points = int(''.join(re.findall(r'\d+', points_raw)))
+        logger_adapter.info(f"当前剩余积分: {current_points} | 约为 {current_points / 2000:.2f} 元")
+        logger_adapter.info("签到任务执行成功！")
+        return {
+            'status': True,
+            'msg': '签到成功',
+            'points': current_points,
+            'username': masked_user,
+            'retries': retry_stats['count']
+        }
+            
     except Exception as e:
-        logger.error(f"异常: {str(e)}", exc_info=True)
-        return False, user, 0, str(e)
+        logger_adapter.error(f"签到任务执行失败: {e}")
+        import traceback
+        logger_adapter.error(f"详细错误信息: {traceback.format_exc()}")
+        return {
+            'status': False,
+            'msg': f'执行异常: {str(e)[:50]}...',
+            'points': 0,
+            'username': masked_user,
+            'retries': retry_stats['count']
+        }
     finally:
-        if driver:
-            try: driver.quit()
-            except: pass
+        if driver is not None:
+            try:
+                logger_adapter.info("正在关闭 WebDriver...")
+                try:
+                    driver.quit()
+                    logger_adapter.info("WebDriver 已安全关闭")
+                except Exception as e:
+                    logger_adapter.error(f"关闭 WebDriver 时出错: {e}")
+                
+                time.sleep(1)
+                
+                try:
+                    if hasattr(driver, 'service') and driver.service.process:
+                        process = driver.service.process
+                        pid = process.pid
+                        
+                        if os.name == 'posix' and pid:
+                            try:
+                                subprocess.run(['pkill', '-9', '-P', str(pid)], stderr=subprocess.DEVNULL)
+                            except Exception:
+                                pass
+
+                        if process.poll() is None:
+                            process.terminate()
+                            try:
+                                process.wait(timeout=2)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                                process.wait()
+                            logger_adapter.info(f"已终止 ChromeDriver 进程 (PID: {pid})")
+                except Exception as e:
+                    logger_adapter.debug(f"清理 ChromeDriver 进程时出错: {e}")
+                        
+            except Exception as e:
+                logger_adapter.error(f"WebDriver 清理过程出现异常: {e}")
+        
+        try:
+            unload_selenium_modules()
+        except:
+            pass
+
+def parse_accounts():
+    usernames_raw = os.getenv("RAINYUN_USER", "").replace("\r\n", "\n").replace("\r", "\n")
+    passwords_raw = os.getenv("RAINYUN_PASS", "").replace("\r\n", "\n").replace("\r", "\n")
+    
+    usernames = [u for u in usernames_raw.split("\n") if u.strip()]
+    passwords = [p for p in passwords_raw.split("\n") if p.strip()]
+    
+    if len(usernames) != len(passwords):
+        logger.warning("用户名和密码数量不匹配，只使用匹配的部分")
+        min_len = min(len(usernames), len(passwords))
+        usernames = usernames[:min_len]
+        passwords = passwords[:min_len]
+    
+    accounts = [(u.strip(), p.strip()) for u, p in zip(usernames, passwords) if u.strip() and p.strip()]
+    
+    if not accounts:
+        single_user = os.getenv("RAINYUN_USER", "username")
+        single_pwd = os.getenv("RAINYUN_PASS", "password")
+        accounts = [(single_user, single_pwd)]
+    
+    logger.info(f"检测到 {len(accounts)} 个账号")
+    for i, (username, _) in enumerate(accounts, 1):
+        masked_user = f"{username[:3]}***{username[-3:] if len(username) > 6 else username}"
+        logger.info(f"账号 {i}: {masked_user}")
+    
+    return accounts
+
+def run_all_accounts():
+    import concurrent.futures
+
+    max_retries = int(os.getenv("CHECKIN_MAX_RETRIES", "2"))
+    max_workers = int(os.getenv("MAX_WORKERS", "3"))
+    stagger_delay = int(os.getenv("MAX_DELAY", "15"))
+    
+    accounts = parse_accounts()
+    results = {}
+    
+    for i, (username, password) in enumerate(accounts):
+        results[username] = {
+            'password': password,
+            'result': None,
+            'retry_count': 0,
+            'index': i + 1
+        }
+    
+    pending_accounts = list(accounts)
+    current_attempt = 0
+    
+    while pending_accounts and current_attempt <= max_retries:
+        if current_attempt == 0:
+            logger.info(f"========== 开始执行签到任务（共 {len(pending_accounts)} 个账号，并发数: {max_workers}） ==========")
+        else:
+            logger.info(f"========== 第 {current_attempt} 次重试（共 {len(pending_accounts)} 个失败账号） ==========")
+        
+        failed_accounts = []
+        future_to_account = {}
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for i, (username, password) in enumerate(pending_accounts):
+                if i > 0 and stagger_delay > 0:
+                     lower_bound = 5
+                     upper_bound = max(5, stagger_delay)
+                     actual_delay = random.randint(lower_bound, upper_bound)
+                     logger.info(f"随机等待 {actual_delay} 秒后启动下一个账号任务...")
+                     time.sleep(actual_delay)
+                
+                account_idx = results[username]['index']
+                retry_info = f"（第 {results[username]['retry_count'] + 1} 次尝试）" if results[username]['retry_count'] > 0 else ""
+                logger.info(f"========== 启动账号 {account_idx}/{len(accounts)} {retry_info} ==========")
+                
+                future = executor.submit(run_checkin, username, password)
+                future_to_account[future] = username
+
+            for future in concurrent.futures.as_completed(future_to_account):
+                username = future_to_account[future]
+                account_idx = results[username]['index']
+                
+                try:
+                    result = future.result()
+                    results[username]['result'] = result
+                    
+                    if result['status']:
+                        logger.info(f"✅ 账号 {account_idx} 签到成功")
+                    else:
+                        logger.error(f"❌ 账号 {account_idx} 签到失败: {result['msg']}")
+                        results[username]['retry_count'] += 1
+                        if results[username]['retry_count'] <= max_retries:
+                            failed_accounts.append((username, results[username]['password']))
+                except Exception as e:
+                    logger.error(f"❌ 账号 {account_idx} 执行异常: {e}")
+                    results[username]['retry_count'] += 1
+                    if results[username]['retry_count'] <= max_retries:
+                        failed_accounts.append((username, results[username]['password']))
+
+        pending_accounts = failed_accounts
+        current_attempt += 1
+        
+        if pending_accounts:
+            retry_wait = 60
+            logger.info(f"等待 {retry_wait} 秒后开始重试 {len(pending_accounts)} 个失败账号...")
+            time.sleep(retry_wait)
+    
+    final_results = [results[username]['result'] for username, _ in accounts]
+    success_count = len([r for r in final_results if r and r['status']])
+    
+    retry_accounts = [(username, results[username]['retry_count']) for username, _ in accounts if results[username]['retry_count'] > 0]
+    if retry_accounts:
+        logger.info(f"重试统计: {len(retry_accounts)} 个账号进行了重试")
+        for username, count in retry_accounts:
+            masked_user = f"{username[:3]}***{username[-3:] if len(username) > 6 else username}"
+            final_status = "成功" if results[username]['result'] and results[username]['result']['status'] else "失败"
+            logger.info(f"  - {masked_user}: 重试 {count} 次, 最终{final_status}")
+    
+    if accounts:
+        try:
+            import notify
+            logger.info("正在发送通知...")
+            
+            notification_title = f"雨云签到: {success_count}/{len(accounts)} 成功"
+            notification_content = f"雨云自动签到结果汇总：\n\n总账户数: {len(accounts)}\n成功账户数: {success_count}\n失败账户数: {len(accounts) - success_count}\n\n详细结果：\n"
+            
+            for i, result in enumerate(final_results, 1):
+                if result:
+                    if result['status']:
+                        notification_content += f"\n{i}. {result['username']}: ✅ 成功 - 积分 {result['points']}"
+                    else:
+                        notification_content += f"\n{i}. {result['username']}: ❌ 失败 - {result['msg']}"
+            
+            notify.send(notification_title, notification_content)
+        except Exception as e:
+            logger.warning(f"发送通知失败: {e}")
+    
+    logger.info("任务完成，执行最终清理...")
+    cleanup_zombie_processes()
+    
+    return success_count > 0
 
 
 if __name__ == "__main__":
-    is_github_actions = os.environ.get("GITHUB_ACTIONS", "false") == "true"
-    debug = os.environ.get('DEBUG', 'false').lower() == 'true'
-    headless = os.environ.get('HEADLESS', 'false').lower() == 'true'
-    auto_update_enabled = os.environ.get('AUTO_UPDATE', 'true').lower() == 'true'
-    if is_github_actions: headless = True
+    timeout = int(os.getenv("TIMEOUT", "15000")) // 1000
+    max_delay = int(os.getenv("MAX_DELAY", "5"))
+    debug = os.getenv("DEBUG", "false").lower() == "true"
+    linux = os.getenv("LINUX_MODE", "true").lower() == "true" or os.path.exists("/.dockerenv")
+    
+    user = os.getenv("RAINYUN_USER", "username").split("|")[0]
+    pwd = os.getenv("RAINYUN_PASS", "password").split("|")[0]
     
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     logger = logging.getLogger(__name__)
+
+    ver = "2.6 (ICR + Cookie)"
+    logger.info("------------------------------------------------------------------")
+    logger.info(f"雨云自动签到工作流 v{ver}")
+    logger.info("------------------------------------------------------------------")
     
-    ver = "2.4"
-    print(f"\n{'='*60}")
-    print(f"  🌧️  雨云自动签到工作流 v{ver}")
-    print(f"{'='*60}\n")
+    setup_sigchld_handler()
+    cleanup_zombie_processes()
     
-    if not AD_ENABLED:
-        print("⚠️  脚本已被远程禁用，请检查配置或联系管理员")
-        exit(1)
-    
-    if MIN_VERSION:
-        try:
-            from packaging import version
-            current_ver = version.parse(ver)
-            min_ver = version.parse(MIN_VERSION)
-            if current_ver < min_ver:
-                print(f"❌ 脚本版本过低！当前: {ver}, 最低要求: {MIN_VERSION}")
-                if UPDATE_URL:
-                    print(f"📥 更新地址: {UPDATE_URL}")
-                exit(1)
-        except ImportError:
-            try:
-                current_parts = [int(x) for x in ver.split('.')]
-                min_parts = [int(x) for x in MIN_VERSION.split('.')]
-                if current_parts < min_parts:
-                    print(f"❌ 脚本版本过低！当前: {ver}, 最低要求: {MIN_VERSION}")
-                    if UPDATE_URL:
-                        print(f"📥 更新地址: {UPDATE_URL}")
-                    exit(1)
-            except Exception:
-                pass
-    
-    if LATEST_VERSION and LATEST_VERSION != ver:
-        print(f"📌 发现新版本: {LATEST_VERSION} (当前: {ver})")
-        if UPDATE_URL:
-            print(f"📥 更新地址: {UPDATE_URL}")
-        print()
-        if auto_update_enabled:
-            auto_update(ver)
-    
-    if AD_LIST:
-        print(f"{'─'*60}")
-        for ad in AD_LIST:
-            print(f"📢 {ad.get('text', '')}")
-            link = ad.get('link')
-            if link and link != 'null':
-                print(f"🔗 {link}")
-        print(f"{'─'*60}\n")
-    elif AD_TEXT:
-        print(f"{'─'*60}")
-        print(f"📢 {AD_TEXT}")
-        if AD_LINK:
-            print(f"🔗 {AD_LINK}")
-        print(f"{'─'*60}\n")
-    
-    accounts = []
-    users_env = os.environ.get("RAINYUN_USER", "")
-    passwords_env = os.environ.get("RAINYUN_PASS", "")
-    users = [user.strip() for user in users_env.split('\n') if user.strip()]
-    passwords = [pwd.strip() for pwd in passwords_env.split('\n') if pwd.strip()]
-    
-    if len(users) == len(passwords) and len(users) > 0:
-        for user, pwd in zip(users, passwords):
-            accounts.append((user, pwd))
-    else:
-        print("❌ 未找到有效账户配置或数量不匹配")
-        exit(1)
-    
-    results = []
-    for i, (user, pwd) in enumerate(accounts, 1):
-        print(f"\n{'─'*60}")
-        print(f"📋 处理账户 {i}/{len(accounts)}: {user}")
-        print(f"{'─'*60}")
-        result = sign_in_account(user, pwd, debug=debug, headless=headless)
-        results.append(result)
-        if result[0]:
-            print(f"✅ 账户 {i} 处理完成")
-        else:
-            print(f"❌ 账户 {i} 处理失败")
-    
-    success_count = sum(1 for r in results if r[0])
-    total_count = len(results)
-    
-    print(f"\n{'='*60}")
-    print(f"📊 签到完成！成功: {success_count}/{total_count}")
-    print(f"{'='*60}\n")
-    
-    if success_count == total_count:
-        notification_title = f"✅ 雨云自动签到完成 - 全部成功"
-    elif success_count > 0:
-        notification_title = f"⚠️ 雨云自动签到完成 - 部分成功 ({success_count}/{total_count})"
-    else:
-        notification_title = f"❌ 雨云自动签到完成 - 全部失败"
-    
-    notification_content = f"雨云自动签到结果汇总：\n\n总账户数: {total_count}\n成功账户数: {success_count}\n失败账户数: {total_count - success_count}\n\n详细结果：\n"
-    
-    for i, (success, user, points, error_msg) in enumerate(results, 1):
-        if success:
-            notification_content += f"{i}. ✅ {user}\n   积分: {points} | 约 {points / 2000:.2f} 元\n"
-        else:
-            notification_content += f"{i}. ❌ {user}\n   错误: {error_msg}\n"
-    
-    if AD_LIST:
-        notification_content += "\n" + "=" * 30 + "\n"
-        for ad in AD_LIST:
-            link = ad.get('link')
-            if link and link != 'null':
-                notification_content += f"📢 {ad.get('text', '')}\n🔗 {link}\n"
-            else:
-                notification_content += f"📢 {ad.get('text', '')}\n"
-        notification_content += "=" * 30 + "\n"
-    elif AD_TEXT:
-        notification_content += "\n" + "=" * 30 + "\n"
-        if AD_LINK:
-            notification_content += f"📢 广告: {AD_TEXT}\n🔗 链接: {AD_LINK}\n"
-        else:
-            notification_content += f"📢 广告: {AD_TEXT}\n"
-        notification_content += "=" * 30 + "\n"
-    
-    try:
-        send(notification_title, notification_content)
-        print("✅ 统一通知发送成功")
-    except Exception as e:
-        print("❌ 发送通知失败")
-    
-    if AD_LIST:
-        print(f"\n{'─'*60}")
-        for ad in AD_LIST:
-            print(f"📢 {ad.get('text', '')}")
-            link = ad.get('link')
-            if link and link != 'null':
-                print(f"🔗 {link}")
-        print(f"{'─'*60}\n")
-    elif AD_TEXT:
-        print(f"\n{'─'*60}")
-        print(f"📢 {AD_TEXT}")
-        if AD_LINK:
-            print(f"🔗 {AD_LINK}")
-        print(f"{'─'*60}\n")
+    run_all_accounts()
